@@ -14,8 +14,19 @@ Codex（ChatGPT Plus）的额度是 **5 小时一个窗口**：窗口内用不�
 | 同一时间点被重复触发 | 记 `skipped_duplicate`，同一天同一时间点只发一次 |
 | 请求失败 / 超时 | 记 `error` / `timeout`，**不重试**，等下一个时间点 |
 | 与另一个心跳重叠 | 记 `skipped_locked`（flock 保护） |
+| 网络预检不通（代理没开、代理变量没带上） | 记 `net_unreachable`（含 `probe_error`），约 10 秒内跳过，不再傻等超时 |
 
 每次心跳会占用一点点额度（大约相当于 1 个请求），这是这个方案的固有成本。
+
+## 代理（重要，cron 的坑在这里）
+
+WSL 的 `autoProxy` 只把 Windows 系统代理注入**交互式会话**；**cron 任务拿到的是一个没有任何代理变量的最小环境**。所以如果 `codex` 需要走代理才能连上服务端，`./pulse.sh` 在交互 shell 里跑得好好的，一放进 cron 就会直连超时——本仓库早期版本就踩了这个坑（三次心跳全部卡到 180 秒超时，日志里是 `workspace routing discovery timed out`）。
+
+脚本现在的处理：
+
+- 配置块里的 `PULSE_PROXY`（默认 `http://127.0.0.1:7890`）会在发心跳前导出为 `http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY`，并补上 `no_proxy/NO_PROXY`（默认 `localhost,127.0.0.1,::1`，保证本机流量不绕代理）。想改回"沿用当前环境"就写 `PULSE_PROXY= `。
+- 发心跳前先探一次网（默认 `https://chatgpt.com/`，8 秒超时，失败重试 1 次），不通就记一条 `net_unreachable` 并跳过——网络问题约 10 秒内可见，而不是 180 秒后以一个沉默的 `timeout` 收场。
+- 判定"通"的标准是 curl 拿到任意 HTTP 状态码（`403` 也算通，说明 TLS 与代理链路没问题）。
 
 ## 安装
 
@@ -42,6 +53,11 @@ PULSE_PROMPT="只回复 OK，不要调用任何工具。"
 PULSE_TIMEOUT=180                         # 单次超时（秒）
 PULSE_GRACE=120                           # 准点窗口（秒）
 PULSE_WORKDIR="/tmp"                      # 心跳的工作目录（不碰你的仓库）
+PULSE_PROXY="http://127.0.0.1:7890"       # 心跳走的代理（cron 不会自动继承 WSL autoProxy）
+PULSE_NET_PROBE=1                         # 发心跳前先探网（1=开）
+PULSE_NET_PROBE_URL="https://chatgpt.com/"
+PULSE_NET_PROBE_TIMEOUT=8                 # 预检超时（秒）
+PULSE_NET_PROBE_RETRY=1                   # 预检失败后重试次数（间隔 3s）
 CODEX_BIN=""                              # 留空 = 自动探测（PATH / nvm）
 ```
 
@@ -76,14 +92,20 @@ CODEX_BIN=""                              # 留空 = 自动探测（PATH / nvm�
 ## 验证一套新安装
 
 ```bash
-./pulse.sh now --dry-run     # 1. 命令、预检是否符合预期（不花额度）
+./pulse.sh now --dry-run     # 1. 看命令、额度预检、代理与网络预检（不花额度）
 ./pulse.sh now               # 2. 发一次真心跳：日志应出现 pulse_ok，且 ~/.codex/session_index.jsonl 不新增条目
 ./pulse.sh status            # 3. 看托管块和最近事件
 ```
 
 想端到端试 cron：把某个时间点临时改成 2 分钟后的时刻 → `./pulse.sh install` → 等 2 分钟 → `tail -n 5 logs/pulse.jsonl` 应出现 `pulse_ok` → 改回正式时刻再 `install`。
 
-已经在这台机器上验证过的部分（2026-10-16 凌晨）：自测 30 项全绿；cron 日程块的生成/幂等/卸载；心跳命令真实打到服务端并能正确识别额度上限；`--ephemeral` 跑完不在 `~/.codex/sessions` 里留下任何文件。额度打满时服务端的原话是 `You've hit your usage limit. ... try again at 1:21 AM.`（退出码 1，报错在 stdout 的 JSON 事件里），脚本会把它记成 `limited` + `reset_hint`。
+已经在这台机器上验证过的部分：
+
+- 自测 39 项全绿（含代理注入、网络预检、cron 式最小环境）。
+- cron 日程块的生成 / 幂等 / 卸载；三次到点触发的时间戳准确。
+- 在 `env -i`（完全没有代理变量的 cron 式环境）里发心跳成功：`pulse_ok`，16 秒，模型只回 `OK`，用量 5 个输出 token、0 推理 token。同一环境下把 `PULSE_PROXY` 置空 → 8 秒内记 `net_unreachable` 并跳过（这就是修复前的故障形态）。
+- `--ephemeral` 跑完不在 `~/.codex/sessions` 里留下任何文件（会话索引行数不变）。
+- 额度打满时服务端原话是 `You've hit your usage limit. ... try again at 1:21 AM.`（退出码 1，报错在 stdout 的 JSON 事件里），脚本记成 `limited` + `reset_hint`。
 
 ## 原理细节
 
@@ -95,6 +117,7 @@ CODEX_BIN=""                              # 留空 = 自动探测（PATH / nvm�
 
 - WSL 没运行时不会触发，也不做 Windows 侧拉起（重启 Windows 后，打开终端或 Codex 即可恢复）。
 - cron 服务需保持启用（本机由 systemd 管理，默认 enabled + active）。
+- 代理客户端（Clash 之类）没开着时，心跳会在约 10 秒内记 `net_unreachable` 跳过（内部重试 1 次），不会留下半途卡死的进程。
 - 无通知：所有结果只写日志（符合"无感"）。
 - 请在你自己的 shell 里跑本脚本：`codex` 需要往 `CODEX_HOME`（默认 `~/.codex`）写状态文件，受限沙箱里会报 `Read-only file system (os error 30)`。
 - 单次心跳的额度开销（`used_percent` 变化）会在第一次真正发成功时记进 `logs/pulse.jsonl` 的 `used_percent_before/after`，届时可据此判断是否需要换更省钱的模型。

@@ -6,6 +6,7 @@
 #   * 由 cron 到点拉起（`./pulse.sh install`），无常驻进程、无轮询；
 #   * 心跳走 `codex exec --ephemeral`，不落盘、不出现在会话列表（用户无感）；
 #   * 到点前先零消耗读本地 rollout 的 rate_limits，5h 额度已打满就跳过；
+#   * 发心跳前显式注入代理并做一次 8 秒网络预检（cron 里没有 WSL autoProxy 的变量）；
 #   * 错过的时间点不补发、失败不重试，全程只写日志。
 #
 # 用法：
@@ -31,6 +32,15 @@ PULSE_PROMPT="${PULSE_PROMPT:-只回复 OK，不要调用任何工具。}"
 PULSE_TIMEOUT="${PULSE_TIMEOUT:-180}"         # 单次心跳超时（秒）
 PULSE_GRACE="${PULSE_GRACE:-120}"             # 准点窗口（秒），超时记为 missed 跳过
 PULSE_WORKDIR="${PULSE_WORKDIR:-/tmp}"        # 心跳运行目录，避免碰到你的仓库
+# 代理：WSL 的 autoProxy 只注入交互式会话，cron 环境里一个代理变量都没有，
+# 所以这里要显式配置。想改回"沿用当前环境"就写 PULSE_PROXY= 。
+PULSE_PROXY="${PULSE_PROXY-http://127.0.0.1:7890}"
+PULSE_NO_PROXY="${PULSE_NO_PROXY:-localhost,127.0.0.1,::1}"
+# 网络预检：发心跳前先探一次网，不通就记 net_unreachable 跳过，不傻等 180 秒
+PULSE_NET_PROBE="${PULSE_NET_PROBE:-1}"
+PULSE_NET_PROBE_URL="${PULSE_NET_PROBE_URL:-https://chatgpt.com/}"
+PULSE_NET_PROBE_TIMEOUT="${PULSE_NET_PROBE_TIMEOUT:-8}"
+PULSE_NET_PROBE_RETRY="${PULSE_NET_PROBE_RETRY:-1}"   # 预检失败后再试几次（每次间隔 3s）
 CODEX_BIN="${CODEX_BIN:-}"                    # 留空 = 自动探测（PATH / nvm）
 LOG_DIR="${LOG_DIR:-}"                        # 留空 = <脚本目录>/logs
 SESSIONS_DIR="${SESSIONS_DIR:-}"              # 留空 = $HOME/.codex/sessions
@@ -82,6 +92,47 @@ detect_codex() {
   if p="$(command -v codex 2>/dev/null)" && [[ -n "$p" && -x "$p" ]]; then printf '%s\n' "$p"; return 0; fi
   for p in "$HOME"/.nvm/versions/node/*/bin/codex; do
     if [[ -x "$p" ]]; then printf '%s\n' "$p"; return 0; fi
+  done
+  return 1
+}
+
+# ------------------------------- 代理 / 网络 --------------------------------
+mask_proxy() { sed -E 's#//[^@/]*@#//***@#' <<<"${1:-}"; }
+
+# 生效的代理：配置优先；配置为空时沿用当前环境已有的代理变量
+effective_proxy() {
+  if [[ -n "$PULSE_PROXY" ]]; then printf '%s' "$PULSE_PROXY"; return 0; fi
+  printf '%s' "${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}"
+}
+
+apply_proxy_env() {
+  local p="$1"
+  [[ -n "$p" ]] || return 0
+  export http_proxy="$p" https_proxy="$p" HTTP_PROXY="$p" HTTPS_PROXY="$p"
+  export no_proxy="${no_proxy:-$PULSE_NO_PROXY}" NO_PROXY="${NO_PROXY:-$PULSE_NO_PROXY}"
+}
+
+# 返回 0 = 通（或预检关闭 / 没装 curl）；1 = 不通（原因写在 NET_PROBE_ERR 里）
+NET_PROBE_ERR=""
+net_probe_ok() {
+  [[ "$PULSE_NET_PROBE" == "1" ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local attempt=0 tries=$(( PULSE_NET_PROBE_RETRY + 1 ))
+  local code="" rc=0 err=""
+  NET_PROBE_ERR=""
+  while (( attempt < tries )); do
+    attempt=$(( attempt + 1 ))
+    err="$(mktemp)"
+    code="$(curl -sS -m "$PULSE_NET_PROBE_TIMEOUT" -o /dev/null -w '%{http_code}' \
+        "$PULSE_NET_PROBE_URL" 2>"$err")" || rc=$?
+    if [[ -n "$code" && "$code" != "000" ]]; then
+      rm -f "$err"
+      return 0
+    fi
+    NET_PROBE_ERR="$(head -c 200 "$err" 2>/dev/null | tr '\n\r' '  ')"
+    [[ -n "$NET_PROBE_ERR" ]] || NET_PROBE_ERR="curl exit=$rc http_code=${code:-none}"
+    rm -f "$err"
+    (( attempt < tries )) && sleep 3
   done
   return 1
 }
@@ -194,6 +245,14 @@ run_pulse() {
         'BEGIN { exit !(p + 0 >= 99.9 && r + 0 > n) }'; then
     limited=1
   fi
+
+  # 代理 + 网络预检（cron 环境里没有 WSL autoProxy 注入的变量，必须自己补）
+  local proxy="" proxy_show="(未设置)" net_ok=1
+  proxy="$(effective_proxy)"
+  apply_proxy_env "$proxy"
+  [[ -n "$proxy" ]] && proxy_show="$(mask_proxy "$proxy")"
+  net_probe_ok || net_ok=0
+
   # 组装心跳命令
   local bin=""; bin="$(detect_codex)" || bin=""
   local -a cmd=()
@@ -205,12 +264,19 @@ run_pulse() {
 
   if [[ "$dry" == "1" ]]; then
     local verdict="会发送心跳"
-    (( limited )) && verdict="会跳过（5h 额度已满）"
+    if (( limited )); then verdict="会跳过（5h 额度已满）"
+    elif (( ! net_ok )); then verdict="会跳过（网络预检不通）"
+    fi
     printf '[dry-run] slot=%s enforce=%s 预检: used_percent=%s resets_at=%s%s\n' \
       "$slot" "$enforce" "${pct_before:-未知}" "${reset_before:-未知}" \
       "${snap_err:+ (快照不可读，跳过预检)}" >&2
+    local net_show="通过"
+    if [[ "$PULSE_NET_PROBE" != "1" ]]; then net_show="已关闭"
+    elif (( ! net_ok )); then net_show="不通（$PULSE_NET_PROBE_URL）"
+    fi
+    printf '[dry-run] 代理=%s 网络预检=%s\n' "$proxy_show" "$net_show" >&2
     printf '[dry-run] %s\n' "$verdict" >&2
-    if (( ! limited )); then
+    if (( ! limited && net_ok )); then
       if [[ -n "$bin" ]]; then
         printf '[dry-run] 将执行: ' >&2; printf '%q ' "${cmd[@]}" >&2; printf '\n' >&2
       else
@@ -219,6 +285,8 @@ run_pulse() {
     fi
     log_event "dry_run" "$slot" \
       ",\"would_skip\":$([[ $limited == 1 ]] && echo true || echo false)"\
+",\"net_ok\":$([[ $net_ok == 1 ]] && echo true || echo false)"\
+",\"proxy\":\"$(json_escape "$proxy_show")\""\
 ",\"used_percent\":${pct_before:-null},\"resets_at\":${reset_before:-null}"
     return 0
   fi
@@ -232,6 +300,14 @@ run_pulse() {
     log_event "skip_limited" "$slot" \
       ",\"used_percent\":${pct_before:-null},\"resets_at\":${reset_before:-null},\"resets_at_local\":$reset_h"
     note "跳过 $slot：5h 额度已满（已用 ${pct_before:-?}%，窗口重置于 $reset_txt）"
+    return 0
+  fi
+
+  if (( ! net_ok )); then
+    log_event "net_unreachable" "$slot" \
+      ",\"probe\":\"$(json_escape "$PULSE_NET_PROBE_URL")\",\"proxy\":\"$(json_escape "$proxy_show")\""\
+",\"probe_error\":\"$(json_escape "$NET_PROBE_ERR")\""
+    note "跳过 $slot：网络预检不通（$PULSE_NET_PROBE_URL，代理 $proxy_show）→ $NET_PROBE_ERR"
     return 0
   fi
 

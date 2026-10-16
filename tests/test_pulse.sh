@@ -8,6 +8,9 @@ PULSE="$ROOT/pulse.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# 让自测与宿主环境的代理设置解耦（用例里自己控制）
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
+
 PASS=0
 FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
@@ -46,6 +49,15 @@ cp "$1" "$STORE"
 EOF
 chmod +x "$BIN/crontab"
 
+# 会把自身环境里的代理变量 dump 出来的假 codex
+cat >"$BIN/codex-env" <<'EOF'
+#!/usr/bin/env bash
+env | grep -iE '^(http_proxy|https_proxy|all_proxy|no_proxy)=' | sort >"${FAKE_ENV_OUT:?FAKE_ENV_OUT 未设置}"
+echo '{"type":"token_count","payload":{"rate_limits":{"primary":{"used_percent":12.0,"window_minutes":300,"resets_at":9999999999}}}}'
+exit 0
+EOF
+chmod +x "$BIN/codex-env"
+
 # write_rollout <file> <used_percent> <resets_at>
 write_rollout() {
   printf '{"timestamp":"2026-01-01T00:00:00Z","type":"token_count","payload":{"rate_limits":{"primary":{"used_percent":%s,"window_minutes":300,"resets_at":%s},"secondary":{"used_percent":5.0,"window_minutes":10080,"resets_at":%s}}}}\n' \
@@ -60,7 +72,7 @@ PAST=$(( $(date +%s) - 3600 ))
 run() {
   local logdir="$1"; shift
   PATH="$BIN:$PATH" LOG_DIR="$logdir" SESSIONS_DIR="$SESS" CODEX_BIN="$BIN/codex" \
-    LOCK_FILE="$TMP/lock" "$PULSE" "$@"
+    LOCK_FILE="$TMP/lock" PULSE_NET_PROBE="${PULSE_NET_PROBE:-0}" "$PULSE" "$@"
 }
 
 events() { grep -o '"event":"[a-z_]*"' "$1/pulse.jsonl" 2>/dev/null | sed 's/.*:"//; s/"$//' | tr '\n' ' '; }
@@ -136,6 +148,45 @@ L12="$TMP/log12"; rm -f "$MARK"; write_rollout "$RL_FILE" 12.0 "$FUTURE"
 env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin" LOG_DIR="$L12" SESSIONS_DIR="$SESS" \
   CODEX_BIN="$BIN/codex" LOCK_FILE="$TMP/lock" "$PULSE" fire --at "$(date +%H:%M)" >/dev/null 2>&1
 expect_contains "最小环境下 fire 正常执行" "$(events "$L12")" "pulse_ok"
+
+echo "== 代理注入（cron 里本来没有任何代理变量）=="
+
+# 配置了 PULSE_PROXY：子进程必须拿到四个变量
+env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin" FAKE_ENV_OUT="$TMP/env13.txt" \
+  LOG_DIR="$TMP/log13" SESSIONS_DIR="$SESS" CODEX_BIN="$BIN/codex-env" LOCK_FILE="$TMP/lock" \
+  PULSE_PROXY="http://127.0.0.1:7890" PULSE_NET_PROBE=0 "$PULSE" now >/dev/null 2>&1
+env13="$(cat "$TMP/env13.txt" 2>/dev/null)"
+expect_contains "子进程拿到 https_proxy" "$env13" "https_proxy=http://127.0.0.1:7890"
+expect_contains "子进程拿到 HTTPS_PROXY" "$env13" "HTTPS_PROXY=http://127.0.0.1:7890"
+expect_contains "子进程拿到 no_proxy" "$env13" "no_proxy=localhost,127.0.0.1,::1"
+
+# PULSE_PROXY 置空且环境里也没有代理：子进程不应该凭空多出代理变量
+env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin" FAKE_ENV_OUT="$TMP/env14.txt" \
+  LOG_DIR="$TMP/log14" SESSIONS_DIR="$SESS" CODEX_BIN="$BIN/codex-env" LOCK_FILE="$TMP/lock" \
+  PULSE_PROXY= PULSE_NET_PROBE=0 "$PULSE" now >/dev/null 2>&1
+expect_empty "PULSE_PROXY 置空时不注入代理" "$(cat "$TMP/env14.txt" 2>/dev/null)"
+
+# PULSE_PROXY 置空但环境有代理：沿用环境里的代理（交互式跑的时候有用）
+env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin" FAKE_ENV_OUT="$TMP/env15.txt" \
+  LOG_DIR="$TMP/log15" SESSIONS_DIR="$SESS" CODEX_BIN="$BIN/codex-env" LOCK_FILE="$TMP/lock" \
+  http_proxy="http://127.0.0.1:8888" PULSE_PROXY= PULSE_NET_PROBE=0 "$PULSE" now >/dev/null 2>&1
+expect_contains "沿用环境里的代理" "$(cat "$TMP/env15.txt" 2>/dev/null)" "https_proxy=http://127.0.0.1:8888"
+
+echo "== 网络预检 =="
+
+if command -v curl >/dev/null 2>&1; then
+  L16="$TMP/log16"; rm -f "$MARK"; write_rollout "$RL_FILE" 12.0 "$FUTURE"
+  env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin" LOG_DIR="$L16" SESSIONS_DIR="$SESS" \
+    CODEX_BIN="$BIN/codex" LOCK_FILE="$TMP/lock" PULSE_PROXY="http://127.0.0.1:9" \
+    PULSE_NET_PROBE=1 PULSE_NET_PROBE_URL="https://127.0.0.1:9/" PULSE_NET_PROBE_TIMEOUT=3 \
+    PULSE_NET_PROBE_RETRY=0 \
+    "$PULSE" now >/dev/null 2>&1
+  expect_contains "预检不通 -> net_unreachable" "$(events "$L16")" "net_unreachable"
+  expect_contains "预检失败原因被记下来" "$(cat "$L16/pulse.jsonl")" '"probe_error"'
+  [[ -f "$MARK" ]] && bad "预检不通时不应调用 codex" || ok "预检不通时没有调用 codex"
+else
+  ok "没有 curl，跳过网络预检用例"
+fi
 
 echo "== 额度快照解析 =="
 
